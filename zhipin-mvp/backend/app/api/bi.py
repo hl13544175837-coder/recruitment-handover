@@ -1,0 +1,90 @@
+"""Demand-owned operational BI endpoints.
+
+These routes expose current progress, blockers and responsibility only. Personal
+performance, ranking and conversion-rate contracts deliberately do not live in
+the API layer.
+"""
+
+from flask import Blueprint, g, jsonify
+
+from .. import db
+from ..middleware.auth import require_auth, require_role
+from ..models import Job, RecruitmentDemand, User
+from ..services.bi_service import (
+    build_demand_operational_metrics,
+    build_staff_operational_workload,
+    build_team_operational_overview,
+)
+from ..services.demand_context_service import (
+    DemandContextError,
+    can_read_demand,
+    resolve_demand_context,
+)
+from .access import same_org
+
+
+bp = Blueprint("bi", __name__)
+
+
+@bp.get("/bi/overview")
+@require_auth
+@require_role("manager", "admin")
+def overview():
+    return jsonify(build_team_operational_overview(g.org_id))
+
+
+@bp.get("/bi/staff/<int:hr_id>")
+@require_auth
+def staff_detail(hr_id):
+    if g.role == "recruiter" and g.user_id != hr_id:
+        return jsonify({"error": "Forbidden"}), 403
+    if g.role not in {"recruiter", "manager", "admin"}:
+        return jsonify({"error": "Forbidden"}), 403
+
+    user = User.query.filter_by(id=hr_id, org_id=g.org_id).first()
+    if user is None:
+        return jsonify({"error": "用户不存在"}), 404
+    return jsonify(build_staff_operational_workload(g.org_id, hr_id))
+
+
+@bp.get("/bi/job/<int:job_id>")
+@require_auth
+def job_funnel(job_id):
+    """Proxy legacy Job BI only when the Job resolves to exactly one Demand."""
+    job = db.session.get(Job, job_id)
+    if job is None or not same_org(job, g.org_id):
+        return jsonify({"error": "岗位不存在"}), 404
+
+    try:
+        demand = resolve_demand_context(org_id=g.org_id, job_id=job_id)
+    except DemandContextError as error:
+        return jsonify(error.as_payload()), error.status_code
+
+    if not can_read_demand(g.user_id, g.role, g.org_id, demand):
+        return jsonify({"error": "Forbidden", "code": "forbidden"}), 403
+    payload = build_demand_operational_metrics(demand)
+    payload.update(
+        {
+            "job_id": job_id,
+            "job_title": job.title,
+            "compatibility": {
+                "mode": "single_demand",
+                "aggregate": False,
+            },
+        }
+    )
+    return jsonify(payload)
+
+
+@bp.get("/bi/demand/<int:demand_id>")
+@require_auth
+def demand_operational_metrics(demand_id):
+    demand = RecruitmentDemand.query.filter_by(
+        id=demand_id,
+        org_id=g.org_id,
+    ).first()
+    if demand is None:
+        return jsonify({"error": "需求不存在", "code": "demand_not_found"}), 404
+    if not can_read_demand(g.user_id, g.role, g.org_id, demand):
+        return jsonify({"error": "Forbidden", "code": "forbidden"}), 403
+    return jsonify(build_demand_operational_metrics(demand))

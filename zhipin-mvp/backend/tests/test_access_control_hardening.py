@@ -1,0 +1,314 @@
+def _auth(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _seed_owned_job_candidate(app, owner_id, title="后端", name="候选人"):
+    with app.app_context():
+        from app import db
+        from app.models import Candidate, CandidateTag, Job, RecruitmentDemand
+
+        job = Job(
+            title=title,
+            jd_text="Python 后端",
+            jd_structured={"skill_tags_raw": "Python , 5 | Flask , 4"},
+            owner_hr_id=owner_id,
+        )
+        candidate = Candidate(
+            owner_hr_id=owner_id,
+            name_masked=name,
+            resume_json={},
+        )
+        db.session.add_all([job, candidate])
+        db.session.flush()
+        db.session.add(RecruitmentDemand(
+            job_id=job.id,
+            owner_hr_id=owner_id,
+            request_no=f"REQ-ACCESS-{job.id}",
+            status="active",
+        ))
+        db.session.add(CandidateTag(candidate_id=candidate.id, tag="Python", score=5))
+        db.session.commit()
+        return job.id, candidate.id
+
+
+def test_match_results_are_scoped_to_recruiter_owned_candidates(client, make_user, app):
+    owner_id, owner_token = make_user("match-owner@x.com", role="recruiter")
+    other_id, _ = make_user("match-other@x.com", role="recruiter")
+    job_id, owner_candidate_id = _seed_owned_job_candidate(
+        app,
+        owner_id,
+        title="Python 后端",
+        name="自有候选人",
+    )
+    _, other_candidate_id = _seed_owned_job_candidate(
+        app,
+        other_id,
+        title="无关岗位",
+        name="他人候选人",
+    )
+
+    response = client.post(f"/api/jobs/{job_id}/match", headers=_auth(owner_token))
+
+    assert response.status_code == 200
+    result_ids = {item["candidate_id"] for item in response.get_json()["results"]}
+    assert owner_candidate_id in result_ids
+    assert other_candidate_id not in result_ids
+
+
+def test_match_preview_is_read_only(client, make_user, app):
+    owner_id, owner_token = make_user("match-preview-owner@x.com", role="recruiter")
+    job_id, candidate_id = _seed_owned_job_candidate(
+        app,
+        owner_id,
+        title="Python 后端",
+        name="预览候选人",
+    )
+
+    with app.app_context():
+        from app.models import Match
+
+        before_count = Match.query.count()
+
+    response = client.get(f"/api/jobs/{job_id}/match-preview", headers=_auth(owner_token))
+
+    assert response.status_code == 200
+    result_ids = {item["candidate_id"] for item in response.get_json()["results"]}
+    assert candidate_id in result_ids
+    with app.app_context():
+        from app.models import Match
+
+        assert Match.query.count() == before_count
+
+
+def test_recruiter_cannot_move_another_recruiters_candidate(client, make_user, app):
+    owner_id, owner_token = make_user("pipeline-owner@x.com", role="recruiter")
+    other_id, _ = make_user("pipeline-other@x.com", role="recruiter")
+    job_id, _ = _seed_owned_job_candidate(app, owner_id)
+    _, other_candidate_id = _seed_owned_job_candidate(app, other_id)
+
+    response = client.post(
+        "/api/pipeline/move",
+        headers=_auth(owner_token),
+        json={
+            "candidate_id": other_candidate_id,
+            "job_id": job_id,
+            "stage": "pending",
+        },
+    )
+
+    assert response.status_code == 403
+
+
+def test_recruiter_cannot_read_another_recruiters_ai_interview(client, make_user, app):
+    owner_id, owner_token = make_user("interview-owner@x.com", role="recruiter")
+    other_id, _ = make_user("interview-other@x.com", role="recruiter")
+    _seed_owned_job_candidate(app, owner_id)
+    other_job_id, other_candidate_id = _seed_owned_job_candidate(app, other_id)
+
+    with app.app_context():
+        from app import db
+        from app.models import Interview
+
+        interview = Interview(
+            candidate_id=other_candidate_id,
+            job_id=other_job_id,
+            qa_json=[],
+            ai_report={"avg_score": 4},
+            score=4,
+            pass_recommended=True,
+        )
+        db.session.add(interview)
+        db.session.commit()
+        interview_id = interview.id
+
+    response = client.get(f"/api/interview/{interview_id}", headers=_auth(owner_token))
+
+    assert response.status_code == 403
+
+
+def test_agent_read_tools_are_scoped_to_current_recruiter(app, make_user):
+    owner_id, _ = make_user("agent-scope-owner@x.com", role="recruiter")
+    other_id, _ = make_user("agent-scope-other@x.com", role="recruiter")
+    _seed_owned_job_candidate(app, owner_id, name="自有候选人")
+    _seed_owned_job_candidate(app, other_id, name="他人候选人")
+
+    with app.app_context():
+        from app.services.agent_service import _tool_list_candidates
+
+        result = _tool_list_candidates(limit=20, _user_id=owner_id, _role="recruiter")
+
+    names = {item["name_masked"] for item in result["candidates"]}
+    assert names == {"自有候选人"}
+
+
+def test_agent_operational_bi_tool_enforces_demand_scope(app, make_user):
+    recruiter_id, _ = make_user("agent-bi-recruiter@x.com", role="recruiter", name="招聘专员A")
+    other_id, _ = make_user("agent-bi-other@x.com", role="recruiter", name="招聘专员B")
+
+    with app.app_context():
+        from app import db
+        from app.models import Job, RecruitmentDemand
+        from app.services.agent_service import _tool_get_bi_overview
+
+        job = Job(title="招聘 BI", jd_text="BI", owner_hr_id=recruiter_id)
+        db.session.add(job)
+        db.session.flush()
+        own = RecruitmentDemand(
+            job_id=job.id,
+            owner_hr_id=recruiter_id,
+            request_no="REQ-BI-OWN",
+            status="active",
+        )
+        other = RecruitmentDemand(
+            job_id=job.id,
+            owner_hr_id=other_id,
+            request_no="REQ-BI-OTHER",
+            status="active",
+        )
+        db.session.add_all([own, other])
+        db.session.commit()
+
+        own_result = _tool_get_bi_overview(
+            demand_id=own.id,
+            _user_id=recruiter_id,
+            _role="recruiter",
+        )
+        forbidden = _tool_get_bi_overview(
+            demand_id=other.id,
+            _user_id=recruiter_id,
+            _role="recruiter",
+        )
+
+    assert own_result["scope"]["demand_id"] == own.id
+    assert own_result["purpose"] == "operational_collaboration"
+    assert "不用于绩效" in own_result["purpose_label"]
+    assert forbidden["error"] == "Forbidden"
+
+
+def test_agent_summary_interview_count_uses_visible_demands_and_candidates(
+    app, make_user
+):
+    owner_id, _ = make_user("agent-count-owner@x.com", role="recruiter")
+    other_id, _ = make_user("agent-count-other@x.com", role="recruiter")
+    manager_id, _ = make_user("agent-count-manager@x.com", role="manager")
+    foreign_id, _ = make_user(
+        "agent-count-foreign@x.com", role="recruiter", org_id=2
+    )
+
+    with app.app_context():
+        from app import db
+        from app.models import Candidate, Interview, Job, RecruitmentDemand
+        from app.services.agent_service import _tool_count_summary
+
+        job = Job(org_id=1, title="AI 概览", jd_text="AI", owner_hr_id=owner_id)
+        foreign_job = Job(
+            org_id=2,
+            title="其他组织",
+            jd_text="Other",
+            owner_hr_id=foreign_id,
+        )
+        db.session.add_all([job, foreign_job])
+        db.session.flush()
+        own_demand = RecruitmentDemand(
+            org_id=1, job_id=job.id, owner_hr_id=owner_id, status="active"
+        )
+        other_demand = RecruitmentDemand(
+            org_id=1, job_id=job.id, owner_hr_id=other_id, status="active"
+        )
+        foreign_demand = RecruitmentDemand(
+            org_id=2,
+            job_id=foreign_job.id,
+            owner_hr_id=foreign_id,
+            status="active",
+        )
+        db.session.add_all([own_demand, other_demand, foreign_demand])
+        db.session.flush()
+        own_candidate = Candidate(
+            org_id=1,
+            owner_hr_id=owner_id,
+            current_demand_id=own_demand.id,
+            name_masked="自有候选人",
+            resume_json={},
+        )
+        other_candidate = Candidate(
+            org_id=1,
+            owner_hr_id=other_id,
+            current_demand_id=other_demand.id,
+            name_masked="他人候选人",
+            resume_json={},
+        )
+        foreign_candidate = Candidate(
+            org_id=2,
+            owner_hr_id=foreign_id,
+            current_demand_id=foreign_demand.id,
+            name_masked="其他组织候选人",
+            resume_json={},
+        )
+        db.session.add_all([own_candidate, other_candidate, foreign_candidate])
+        db.session.flush()
+        db.session.add_all(
+            [
+                Interview(
+                    org_id=1,
+                    candidate_id=own_candidate.id,
+                    job_id=job.id,
+                    demand_id=own_demand.id,
+                    qa_json=[],
+                ),
+                Interview(
+                    org_id=1,
+                    candidate_id=other_candidate.id,
+                    job_id=job.id,
+                    demand_id=other_demand.id,
+                    qa_json=[],
+                ),
+                Interview(
+                    org_id=1,
+                    candidate_id=own_candidate.id,
+                    job_id=job.id,
+                    demand_id=other_demand.id,
+                    qa_json=[],
+                ),
+                Interview(
+                    org_id=2,
+                    candidate_id=foreign_candidate.id,
+                    job_id=foreign_job.id,
+                    demand_id=foreign_demand.id,
+                    qa_json=[],
+                ),
+            ]
+        )
+        db.session.commit()
+
+        recruiter_result = _tool_count_summary(
+            _user_id=owner_id, _role="recruiter"
+        )
+        manager_result = _tool_count_summary(
+            _user_id=manager_id, _role="manager"
+        )
+
+    assert recruiter_result["interview_count"] == 1
+    assert manager_result["interview_count"] == 3
+
+
+def test_agent_write_tool_rejects_cross_recruiter_pipeline_move(app, make_user):
+    owner_id, _ = make_user("agent-write-owner@x.com", role="recruiter")
+    other_id, _ = make_user("agent-write-other@x.com", role="recruiter")
+    job_id, _ = _seed_owned_job_candidate(app, owner_id)
+    _, other_candidate_id = _seed_owned_job_candidate(app, other_id)
+
+    with app.app_context():
+        from app.services.agent_service import execute_write_tool
+
+        result = execute_write_tool(
+            "move_pipeline",
+            {
+                "candidate_id": other_candidate_id,
+                "job_id": job_id,
+                "stage": "pending",
+            },
+            user_id=owner_id,
+            role="recruiter",
+        )
+
+    assert result["ok"] is False
